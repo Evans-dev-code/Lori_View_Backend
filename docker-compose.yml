@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+
+  fleet-db:
+    image: timescale/timescaledb:latest-pg16
+    container_name: fleet-db
+    environment:
+      POSTGRES_USER: fleetadmin
+      POSTGRES_PASSWORD: fleet1234
+      POSTGRES_DB: fleetmanager
+    ports:
+      - "5432:5432"
+    volumes:
+      - fleet-db-data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  fleet-redis:
+    image: redis:7-alpine
+    container_name: fleet-redis
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+
+volumes:
+  fleet-db-data:
