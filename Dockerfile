@@ -3,6 +3,7 @@ WORKDIR /app
 COPY . .
 RUN gradle bootJar --no-daemon -x test
 
+
 # Stage 2 — run the jar
 FROM eclipse-temurin:21-jre-alpine
 WORKDIR /app
