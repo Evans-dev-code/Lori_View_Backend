@@ -62,7 +62,7 @@ public class SecurityConfig {
         config.setAllowedOriginPatterns(List.of(
                 "http://localhost:4200",
                 "http://localhost:8080",
-                "https://*.loriview.com"
+                "https://lori-view-frontend.vercel.app/"
         ));
         config.setAllowedMethods(List.of(
                 "GET","POST","PUT","PATCH","DELETE","OPTIONS"
