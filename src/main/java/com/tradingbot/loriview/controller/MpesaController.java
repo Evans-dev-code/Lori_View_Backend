@@ -8,6 +8,7 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
 import java.math.BigDecimal;
+import java.util.HashMap;
 import java.util.Map;
 
 @Slf4j
@@ -36,10 +37,16 @@ public class MpesaController {
     // Safaricom calls this URL automatically after payment
     // This URL must be LIVE (https) when going to production
     @PostMapping("/callback")
-    public ResponseEntity<String> handleCallback(
+    public ResponseEntity<Map<String, Object>> handleCallback(
             @RequestBody Map<String, Object> callbackData) {
         log.info("M-Pesa callback received");
         mpesaService.handleCallback(callbackData);
-        return ResponseEntity.ok("Callback processed");
+
+        // Safaricom expects a JSON acknowledgment to stop retrying
+        Map<String, Object> response = new HashMap<>();
+        response.put("ResultCode", 0);
+        response.put("ResultDesc", "Accepted");
+
+        return ResponseEntity.ok(response);
     }
 }
