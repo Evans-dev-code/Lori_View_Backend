@@ -38,7 +38,7 @@ public class MpesaService {
     private final SubscriptionRepository subscriptionRepository;
     private final SubscriptionService subscriptionService;
     private final RestTemplate restTemplate;
-    private final ObjectMapper objectMapper;
+    private final ObjectMapper objectMapper; // Jackson 2 mapper — used manually below
 
     @Value("${mpesa.consumer.key}")
     private String consumerKey;
@@ -62,6 +62,8 @@ public class MpesaService {
     private String stkPushUrl;
 
     // Step 1 — Get OAuth access token from Safaricom
+    // Receives raw String, parses manually with our own Jackson 2 ObjectMapper
+    // This avoids Spring's Jackson 3 HttpMessageConverter entirely.
     private String getAccessToken() {
         String credentials = consumerKey + ":" + consumerSecret;
         String encoded = Base64.getEncoder()
@@ -72,19 +74,30 @@ public class MpesaService {
 
         HttpEntity<Void> entity = new HttpEntity<>(headers);
 
-        ResponseEntity<JsonNode> response = restTemplate.exchange(
+        // Request as String, NOT JsonNode
+        ResponseEntity<String> response = restTemplate.exchange(
                 authUrl,
                 HttpMethod.GET,
                 entity,
-                JsonNode.class
+                String.class
         );
 
-        JsonNode body = response.getBody();
-        if (body == null || !body.has("access_token")) {
-            throw new RuntimeException("Failed to get M-Pesa access token");
+        String rawBody = response.getBody();
+        if (rawBody == null || rawBody.isBlank()) {
+            throw new RuntimeException("Empty response from M-Pesa auth endpoint");
         }
 
-        return body.get("access_token").asText();
+        try {
+            JsonNode body = objectMapper.readTree(rawBody);
+            if (!body.has("access_token")) {
+                throw new RuntimeException(
+                        "Failed to get M-Pesa access token: " + rawBody);
+            }
+            return body.get("access_token").asText();
+        } catch (Exception e) {
+            throw new RuntimeException(
+                    "Failed to parse M-Pesa auth response: " + e.getMessage(), e);
+        }
     }
 
     // Step 2 — Initiate STK Push to owner's phone
@@ -102,11 +115,9 @@ public class MpesaService {
                 .orElseThrow(() -> new EntityNotFoundException(
                         "Subscription not found: " + subscriptionId));
 
-        // Timestamp in M-Pesa required format
         String timestamp = LocalDateTime.now()
                 .format(DateTimeFormatter.ofPattern("yyyyMMddHHmmss"));
 
-        // M-Pesa password = Base64(shortcode + passkey + timestamp)
         String rawPassword = shortcode + passkey + timestamp;
         String password = Base64.getEncoder()
                 .encodeToString(rawPassword.getBytes(StandardCharsets.UTF_8));
@@ -133,20 +144,23 @@ public class MpesaService {
         HttpEntity<Map<String, Object>> request = new HttpEntity<>(body, headers);
 
         try {
-            ResponseEntity<JsonNode> response = restTemplate.exchange(
+            // Request as String, NOT JsonNode
+            ResponseEntity<String> response = restTemplate.exchange(
                     stkPushUrl,
                     HttpMethod.POST,
                     request,
-                    JsonNode.class
+                    String.class
             );
 
-            JsonNode responseBody = response.getBody();
-            if (responseBody == null) {
+            String rawBody = response.getBody();
+            if (rawBody == null || rawBody.isBlank()) {
                 throw new RuntimeException("Empty response from M-Pesa STK push");
             }
 
-            String merchantRequestId  = responseBody.get("MerchantRequestID").asText();
-            String checkoutRequestId  = responseBody.get("CheckoutRequestID").asText();
+            JsonNode responseBody = objectMapper.readTree(rawBody);
+
+            String merchantRequestId = responseBody.get("MerchantRequestID").asText();
+            String checkoutRequestId = responseBody.get("CheckoutRequestID").asText();
 
             log.info("STK Push sent | owner: {} | checkoutRequestId: {}",
                     ownerId, checkoutRequestId);
@@ -174,7 +188,6 @@ public class MpesaService {
     @Transactional
     public void handleCallback(Map<String, Object> callbackData) {
         try {
-            // Parse nested callback structure from Safaricom
             @SuppressWarnings("unchecked")
             Map<String, Object> bodyMap = (Map<String, Object>)
                     callbackData.get("Body");
@@ -196,7 +209,6 @@ public class MpesaService {
                             "Payment not found for checkout: " + checkoutRequestId));
 
             if (resultCode == 0) {
-                // Payment was successful
                 @SuppressWarnings("unchecked")
                 Map<String, Object> metadata = (Map<String, Object>)
                         stkCallback.get("CallbackMetadata");
@@ -215,7 +227,6 @@ public class MpesaService {
                 payment.setPaidAt(ZonedDateTime.now());
                 paymentRepository.save(payment);
 
-                // Activate the owner's subscription
                 subscriptionService.activateSubscription(
                         payment.getSubscription().getId());
 
@@ -223,7 +234,6 @@ public class MpesaService {
                         receiptNumber, payment.getOwner().getId());
 
             } else {
-                // Payment failed or was cancelled
                 payment.setStatus(PaymentStatus.FAILED);
                 payment.setResultCode(String.valueOf(resultCode));
                 payment.setResultDescription(resultDesc);
@@ -240,7 +250,6 @@ public class MpesaService {
         }
     }
 
-    // Format phone to 254XXXXXXXXX
     private String formatPhone(String phone) {
         phone = phone.trim().replaceAll("\\s+", "");
         if (phone.startsWith("0")) {
@@ -252,7 +261,6 @@ public class MpesaService {
         return phone;
     }
 
-    // Extract a named value from M-Pesa callback metadata
     private String extractMetadataValue(List<Map<String, Object>> items,
                                         String name) {
         return items.stream()
