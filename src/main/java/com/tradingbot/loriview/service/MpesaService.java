@@ -16,6 +16,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.*;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.client.HttpStatusCodeException;
 import org.springframework.web.client.RestTemplate;
 
 import java.math.BigDecimal;
@@ -38,7 +39,7 @@ public class MpesaService {
     private final SubscriptionRepository subscriptionRepository;
     private final SubscriptionService subscriptionService;
     private final RestTemplate restTemplate;
-    private final ObjectMapper objectMapper; // Jackson 2 mapper — used manually below
+    private final ObjectMapper objectMapper;
 
     @Value("${mpesa.consumer.key}")
     private String consumerKey;
@@ -61,12 +62,10 @@ public class MpesaService {
     @Value("${mpesa.stk.push.url}")
     private String stkPushUrl;
 
-    @Value("${mpesa.stk.query.url}")
+    @Value("${mpesa.stk.query.url:}")
     private String stkQueryUrl;
 
     // Step 1 — Get OAuth access token from Safaricom
-    // Receives raw String, parses manually with our own Jackson 2 ObjectMapper
-    // This avoids Spring's Jackson 3 HttpMessageConverter entirely.
     private String getAccessToken() {
         String credentials = consumerKey + ":" + consumerSecret;
         String encoded = Base64.getEncoder()
@@ -77,29 +76,30 @@ public class MpesaService {
 
         HttpEntity<Void> entity = new HttpEntity<>(headers);
 
-        // Request as String, NOT JsonNode
-        ResponseEntity<String> response = restTemplate.exchange(
-                authUrl,
-                HttpMethod.GET,
-                entity,
-                String.class
-        );
-
-        String rawBody = response.getBody();
-        if (rawBody == null || rawBody.isBlank()) {
-            throw new RuntimeException("Empty response from M-Pesa auth endpoint");
-        }
-
         try {
+            ResponseEntity<String> response = restTemplate.exchange(
+                    authUrl,
+                    HttpMethod.GET,
+                    entity,
+                    String.class
+            );
+
+            String rawBody = response.getBody();
+            if (rawBody == null || rawBody.isBlank()) {
+                throw new RuntimeException("Empty response from M-Pesa auth endpoint");
+            }
+
             JsonNode body = objectMapper.readTree(rawBody);
             if (!body.has("access_token")) {
-                throw new RuntimeException(
-                        "Failed to get M-Pesa access token: " + rawBody);
+                throw new RuntimeException("Failed to get M-Pesa access token: " + rawBody);
             }
             return body.get("access_token").asText();
+
+        } catch (HttpStatusCodeException e) {
+            log.error("Safaricom Auth Error: {}", e.getResponseBodyAsString());
+            throw new RuntimeException("Safaricom Auth failed: " + e.getResponseBodyAsString());
         } catch (Exception e) {
-            throw new RuntimeException(
-                    "Failed to parse M-Pesa auth response: " + e.getMessage(), e);
+            throw new RuntimeException("Failed to parse M-Pesa auth response", e);
         }
     }
 
@@ -111,20 +111,14 @@ public class MpesaService {
                                    BigDecimal amountKes) {
 
         Owner owner = ownerRepository.findById(ownerId)
-                .orElseThrow(() -> new EntityNotFoundException(
-                        "Owner not found: " + ownerId));
+                .orElseThrow(() -> new EntityNotFoundException("Owner not found: " + ownerId));
 
         Subscription subscription = subscriptionRepository.findById(subscriptionId)
-                .orElseThrow(() -> new EntityNotFoundException(
-                        "Subscription not found: " + subscriptionId));
+                .orElseThrow(() -> new EntityNotFoundException("Subscription not found: " + subscriptionId));
 
-        String timestamp = LocalDateTime.now()
-                .format(DateTimeFormatter.ofPattern("yyyyMMddHHmmss"));
-
+        String timestamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMddHHmmss"));
         String rawPassword = shortcode + passkey + timestamp;
-        String password = Base64.getEncoder()
-                .encodeToString(rawPassword.getBytes(StandardCharsets.UTF_8));
-
+        String password = Base64.getEncoder().encodeToString(rawPassword.getBytes(StandardCharsets.UTF_8));
         String formattedPhone = formatPhone(phoneNumber);
 
         Map<String, Object> body = new HashMap<>();
@@ -147,12 +141,8 @@ public class MpesaService {
         HttpEntity<Map<String, Object>> request = new HttpEntity<>(body, headers);
 
         try {
-            // Request as String, NOT JsonNode
             ResponseEntity<String> response = restTemplate.exchange(
-                    stkPushUrl,
-                    HttpMethod.POST,
-                    request,
-                    String.class
+                    stkPushUrl, HttpMethod.POST, request, String.class
             );
 
             String rawBody = response.getBody();
@@ -165,8 +155,7 @@ public class MpesaService {
             String merchantRequestId = responseBody.get("MerchantRequestID").asText();
             String checkoutRequestId = responseBody.get("CheckoutRequestID").asText();
 
-            log.info("STK Push sent | owner: {} | checkoutRequestId: {}",
-                    ownerId, checkoutRequestId);
+            log.info("STK Push sent | owner: {} | checkoutRequestId: {}", ownerId, checkoutRequestId);
 
             Payment payment = Payment.builder()
                     .owner(owner)
@@ -180,10 +169,13 @@ public class MpesaService {
 
             return paymentRepository.save(payment);
 
+        } catch (HttpStatusCodeException e) {
+            // Enhanced Error Logging to see exactly why Safaricom rejected the push
+            log.error("STK Push rejected by Safaricom for owner {}. Safaricom Response: {}", ownerId, e.getResponseBodyAsString());
+            throw new RuntimeException("Safaricom rejected the payment request: " + e.getResponseBodyAsString());
         } catch (Exception e) {
             log.error("STK Push failed for owner {}: {}", ownerId, e.getMessage());
-            throw new RuntimeException(
-                    "Failed to initiate M-Pesa payment: " + e.getMessage());
+            throw new RuntimeException("Failed to initiate M-Pesa payment: " + e.getMessage());
         }
     }
 
@@ -192,36 +184,30 @@ public class MpesaService {
     public void handleCallback(Map<String, Object> callbackData) {
         try {
             @SuppressWarnings("unchecked")
-            Map<String, Object> bodyMap = (Map<String, Object>)
-                    callbackData.get("Body");
-
+            Map<String, Object> bodyMap = (Map<String, Object>) callbackData.get("Body");
             @SuppressWarnings("unchecked")
-            Map<String, Object> stkCallback = (Map<String, Object>)
-                    bodyMap.get("stkCallback");
+            Map<String, Object> stkCallback = (Map<String, Object>) bodyMap.get("stkCallback");
 
-            String checkoutRequestId = stkCallback
-                    .get("CheckoutRequestID").toString();
-            int resultCode = Integer.parseInt(
-                    stkCallback.get("ResultCode").toString());
-            String resultDesc = stkCallback
-                    .get("ResultDesc").toString();
+            String checkoutRequestId = stkCallback.get("CheckoutRequestID").toString();
+            int resultCode = Integer.parseInt(stkCallback.get("ResultCode").toString());
+            String resultDesc = stkCallback.get("ResultDesc").toString();
 
-            Payment payment = paymentRepository
-                    .findByCheckoutRequestId(checkoutRequestId)
-                    .orElseThrow(() -> new EntityNotFoundException(
-                            "Payment not found for checkout: " + checkoutRequestId));
+            Payment payment = paymentRepository.findByCheckoutRequestId(checkoutRequestId)
+                    .orElseThrow(() -> new EntityNotFoundException("Payment not found: " + checkoutRequestId));
+
+            // Prevent double-processing if the poll already updated it
+            if (payment.getStatus() != PaymentStatus.PENDING) {
+                log.info("Callback received but payment {} is already resolved.", checkoutRequestId);
+                return;
+            }
 
             if (resultCode == 0) {
                 @SuppressWarnings("unchecked")
-                Map<String, Object> metadata = (Map<String, Object>)
-                        stkCallback.get("CallbackMetadata");
-
+                Map<String, Object> metadata = (Map<String, Object>) stkCallback.get("CallbackMetadata");
                 @SuppressWarnings("unchecked")
-                List<Map<String, Object>> items =
-                        (List<Map<String, Object>>) metadata.get("Item");
+                List<Map<String, Object>> items = (List<Map<String, Object>>) metadata.get("Item");
 
-                String receiptNumber = extractMetadataValue(
-                        items, "MpesaReceiptNumber");
+                String receiptNumber = extractMetadataValue(items, "MpesaReceiptNumber");
 
                 payment.setStatus(PaymentStatus.SUCCESS);
                 payment.setMpesaReceiptNumber(receiptNumber);
@@ -230,26 +216,20 @@ public class MpesaService {
                 payment.setPaidAt(ZonedDateTime.now());
                 paymentRepository.save(payment);
 
-                subscriptionService.activateSubscription(
-                        payment.getSubscription().getId());
-
-                log.info("Payment SUCCESS | receipt: {} | owner: {}",
-                        receiptNumber, payment.getOwner().getId());
+                subscriptionService.activateSubscription(payment.getSubscription().getId());
+                log.info("Payment SUCCESS (Callback) | receipt: {} | owner: {}", receiptNumber, payment.getOwner().getId());
 
             } else {
                 payment.setStatus(PaymentStatus.FAILED);
                 payment.setResultCode(String.valueOf(resultCode));
                 payment.setResultDescription(resultDesc);
                 paymentRepository.save(payment);
-
-                log.warn("Payment FAILED | reason: {} | owner: {}",
-                        resultDesc, payment.getOwner().getId());
+                log.warn("Payment FAILED (Callback) | reason: {} | owner: {}", resultDesc, payment.getOwner().getId());
             }
 
         } catch (Exception e) {
             log.error("Error processing M-Pesa callback: {}", e.getMessage());
-            throw new RuntimeException(
-                    "Callback processing failed: " + e.getMessage());
+            throw new RuntimeException("Callback processing failed: " + e.getMessage());
         }
     }
 
@@ -264,8 +244,8 @@ public class MpesaService {
         return phone;
     }
 
-    private String extractMetadataValue(List<Map<String, Object>> items,
-                                        String name) {
+    private String extractMetadataValue(List<Map<String, Object>> items, String name) {
+        if (items == null) return null;
         return items.stream()
                 .filter(item -> name.equals(item.get("Name")))
                 .findFirst()
@@ -274,15 +254,10 @@ public class MpesaService {
     }
 
     // Step 4 — Query Safaricom directly for real-time STK status
-// Used when callback hasn't arrived yet, so frontend isn't stuck guessing
     public Map<String, Object> queryStkStatus(String checkoutRequestId) {
-
-        String timestamp = LocalDateTime.now()
-                .format(DateTimeFormatter.ofPattern("yyyyMMddHHmmss"));
-
+        String timestamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMddHHmmss"));
         String rawPassword = shortcode + passkey + timestamp;
-        String password = Base64.getEncoder()
-                .encodeToString(rawPassword.getBytes(StandardCharsets.UTF_8));
+        String password = Base64.getEncoder().encodeToString(rawPassword.getBytes(StandardCharsets.UTF_8));
 
         Map<String, Object> body = new HashMap<>();
         body.put("BusinessShortCode", shortcode);
@@ -298,23 +273,17 @@ public class MpesaService {
 
         try {
             ResponseEntity<String> response = restTemplate.exchange(
-                    stkQueryUrl,
-                    HttpMethod.POST,
-                    request,
-                    String.class
+                    stkQueryUrl, HttpMethod.POST, request, String.class
             );
 
-            String rawBody = response.getBody();
-            JsonNode result = objectMapper.readTree(rawBody);
-
+            JsonNode result = objectMapper.readTree(response.getBody());
             Map<String, Object> parsed = new HashMap<>();
             parsed.put("resultCode", result.path("ResultCode").asText());
             parsed.put("resultDesc", result.path("ResultDesc").asText());
             return parsed;
 
         } catch (Exception e) {
-            log.warn("STK status query failed for {}: {}",
-                    checkoutRequestId, e.getMessage());
+            // Safaricom often returns 400 or 500 when the transaction is still pending processing
             Map<String, Object> fallback = new HashMap<>();
             fallback.put("resultCode", "PENDING");
             fallback.put("resultDesc", "Still waiting for confirmation");
@@ -323,43 +292,57 @@ public class MpesaService {
     }
 
     // Step 5 — Get payment status combining DB + live Safaricom query
+    @Transactional
     public Map<String, Object> getPaymentStatus(String checkoutRequestId) {
 
-        Payment payment = paymentRepository
-                .findByCheckoutRequestId(checkoutRequestId)
-                .orElseThrow(() -> new EntityNotFoundException(
-                        "Payment not found for checkout: " + checkoutRequestId));
+        Payment payment = paymentRepository.findByCheckoutRequestId(checkoutRequestId)
+                .orElseThrow(() -> new EntityNotFoundException("Payment not found for checkout: " + checkoutRequestId));
 
         Map<String, Object> result = new HashMap<>();
 
-        // If already resolved in our DB (callback already arrived), return immediately
-        if (payment.getStatus() == PaymentStatus.SUCCESS
-                || payment.getStatus() == PaymentStatus.FAILED) {
+        // If already resolved in our DB, return immediately
+        if (payment.getStatus() == PaymentStatus.SUCCESS || payment.getStatus() == PaymentStatus.FAILED) {
             result.put("status", payment.getStatus().toString());
             result.put("message", payment.getResultDescription());
             result.put("receiptNumber", payment.getMpesaReceiptNumber());
             return result;
         }
 
-        // Still PENDING in our DB — actively query Safaricom for the latest status
+        // Still PENDING in our DB — query Safaricom for the latest status
         Map<String, Object> liveStatus = queryStkStatus(checkoutRequestId);
         String resultCode = String.valueOf(liveStatus.get("resultCode"));
+        String resultDesc = String.valueOf(liveStatus.get("resultDesc"));
 
         if ("0".equals(resultCode)) {
-            // Safaricom confirms success but our callback hasn't landed yet
+            // SELF-HEALING: Safaricom confirms success but callback is delayed/lost
+            payment.setStatus(PaymentStatus.SUCCESS);
+            payment.setResultCode(resultCode);
+            payment.setResultDescription(resultDesc);
+            payment.setPaidAt(ZonedDateTime.now());
+            paymentRepository.save(payment);
+
+            subscriptionService.activateSubscription(payment.getSubscription().getId());
+            log.info("Payment SUCCESS (Self-Healed via Query) | owner: {}", payment.getOwner().getId());
+
             result.put("status", "SUCCESS");
             result.put("message", "Payment confirmed");
-        } else if ("PENDING".equals(resultCode) || "1037".equals(resultCode)) {
-            // 1037 = timeout waiting for user PIN entry
-            result.put("status", "PENDING");
-            result.put("message", "Waiting for PIN entry on phone");
+
         } else if ("1032".equals(resultCode)) {
-            // User cancelled the request
+            // SELF-HEALING: User cancelled the request
+            payment.setStatus(PaymentStatus.FAILED);
+            payment.setResultCode(resultCode);
+            payment.setResultDescription("Payment cancelled by user");
+            paymentRepository.save(payment);
+
             result.put("status", "FAILED");
             result.put("message", "Payment was cancelled");
+
+        } else if ("PENDING".equals(resultCode) || "1037".equals(resultCode)) {
+            result.put("status", "PENDING");
+            result.put("message", "Waiting for PIN entry on phone");
         } else {
             result.put("status", "PENDING");
-            result.put("message", liveStatus.get("resultDesc"));
+            result.put("message", resultDesc);
         }
 
         return result;
