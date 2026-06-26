@@ -61,6 +61,9 @@ public class MpesaService {
     @Value("${mpesa.stk.push.url}")
     private String stkPushUrl;
 
+    @Value("${mpesa.stk.query.url}")
+    private String stkQueryUrl;
+
     // Step 1 — Get OAuth access token from Safaricom
     // Receives raw String, parses manually with our own Jackson 2 ObjectMapper
     // This avoids Spring's Jackson 3 HttpMessageConverter entirely.
@@ -268,5 +271,97 @@ public class MpesaService {
                 .findFirst()
                 .map(item -> item.getOrDefault("Value", "").toString())
                 .orElse(null);
+    }
+
+    // Step 4 — Query Safaricom directly for real-time STK status
+// Used when callback hasn't arrived yet, so frontend isn't stuck guessing
+    public Map<String, Object> queryStkStatus(String checkoutRequestId) {
+
+        String timestamp = LocalDateTime.now()
+                .format(DateTimeFormatter.ofPattern("yyyyMMddHHmmss"));
+
+        String rawPassword = shortcode + passkey + timestamp;
+        String password = Base64.getEncoder()
+                .encodeToString(rawPassword.getBytes(StandardCharsets.UTF_8));
+
+        Map<String, Object> body = new HashMap<>();
+        body.put("BusinessShortCode", shortcode);
+        body.put("Password", password);
+        body.put("Timestamp", timestamp);
+        body.put("CheckoutRequestID", checkoutRequestId);
+
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        headers.setBearerAuth(getAccessToken());
+
+        HttpEntity<Map<String, Object>> request = new HttpEntity<>(body, headers);
+
+        try {
+            ResponseEntity<String> response = restTemplate.exchange(
+                    stkQueryUrl,
+                    HttpMethod.POST,
+                    request,
+                    String.class
+            );
+
+            String rawBody = response.getBody();
+            JsonNode result = objectMapper.readTree(rawBody);
+
+            Map<String, Object> parsed = new HashMap<>();
+            parsed.put("resultCode", result.path("ResultCode").asText());
+            parsed.put("resultDesc", result.path("ResultDesc").asText());
+            return parsed;
+
+        } catch (Exception e) {
+            log.warn("STK status query failed for {}: {}",
+                    checkoutRequestId, e.getMessage());
+            Map<String, Object> fallback = new HashMap<>();
+            fallback.put("resultCode", "PENDING");
+            fallback.put("resultDesc", "Still waiting for confirmation");
+            return fallback;
+        }
+    }
+
+    // Step 5 — Get payment status combining DB + live Safaricom query
+    public Map<String, Object> getPaymentStatus(String checkoutRequestId) {
+
+        Payment payment = paymentRepository
+                .findByCheckoutRequestId(checkoutRequestId)
+                .orElseThrow(() -> new EntityNotFoundException(
+                        "Payment not found for checkout: " + checkoutRequestId));
+
+        Map<String, Object> result = new HashMap<>();
+
+        // If already resolved in our DB (callback already arrived), return immediately
+        if (payment.getStatus() == PaymentStatus.SUCCESS
+                || payment.getStatus() == PaymentStatus.FAILED) {
+            result.put("status", payment.getStatus().toString());
+            result.put("message", payment.getResultDescription());
+            result.put("receiptNumber", payment.getMpesaReceiptNumber());
+            return result;
+        }
+
+        // Still PENDING in our DB — actively query Safaricom for the latest status
+        Map<String, Object> liveStatus = queryStkStatus(checkoutRequestId);
+        String resultCode = String.valueOf(liveStatus.get("resultCode"));
+
+        if ("0".equals(resultCode)) {
+            // Safaricom confirms success but our callback hasn't landed yet
+            result.put("status", "SUCCESS");
+            result.put("message", "Payment confirmed");
+        } else if ("PENDING".equals(resultCode) || "1037".equals(resultCode)) {
+            // 1037 = timeout waiting for user PIN entry
+            result.put("status", "PENDING");
+            result.put("message", "Waiting for PIN entry on phone");
+        } else if ("1032".equals(resultCode)) {
+            // User cancelled the request
+            result.put("status", "FAILED");
+            result.put("message", "Payment was cancelled");
+        } else {
+            result.put("status", "PENDING");
+            result.put("message", liveStatus.get("resultDesc"));
+        }
+
+        return result;
     }
 }

@@ -72,4 +72,13 @@ public class MpesaController {
             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(response);
         }
     }
+
+    // GET /api/v1/mpesa/status/{checkoutRequestId}
+    @GetMapping("/status/{checkoutRequestId}")
+    public ResponseEntity<Map<String, Object>> getPaymentStatus(
+            @PathVariable String checkoutRequestId) {
+        return ResponseEntity.ok(
+                mpesaService.getPaymentStatus(checkoutRequestId)
+        );
+    }
 }
